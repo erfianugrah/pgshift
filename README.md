@@ -30,6 +30,7 @@ A cross-region migration is ~7 independent workstreams. Most are already covered
 - **WAL bloat is the #1 outage** → `watch` aborts if the slot retains more than `watchdog.maxRetainedWalMb` on the source.
 - **Replica identity** → `preflight` fails any published table lacking a PK / unique index / `REPLICA IDENTITY FULL`.
 - **Subscriber privilege** → `preflight` checks the target role can `CREATE SUBSCRIPTION` (documented-supported, but verified).
+- **Cross-schema FKs (the `auth.users` trap)** → `public.documents.user_id` references `auth.users`. `auth` is not replicated, so its data must be restored on the target *before* the initial copy or every row is FK-rejected. `doctor` flags it; see "What this tool does NOT replicate".
 - **Direct connection, not pooler**; target needs IPv6 (or the source's IPv4 add-on).
 - **Teardown order** → disable → `SET (slot_name = NONE)` → drop subscription → drop slot → drop publication, or it hangs.
 - **Never re-enable writes on the source** after cutover (split-brain) — `cutover` says so.
@@ -44,6 +45,45 @@ cp .env.example .env                                  # DIRECT connection string
 
 Secrets live only in `.env` (connection strings, access token). The YAML is non-secret and commit-safe.
 
+### Connection: direct vs pooler (IPv6 trap)
+
+This tool needs a **direct** connection (`db.<ref>.supabase.co:5432`) on both ends —
+the pooler (`*.pooler.supabase.com`) **cannot stream logical replication**. The direct
+host is **IPv6-only** unless the project has the [IPv4 add-on](https://supabase.com/docs/guides/platform/ipv4-address).
+If the box you run `sbmigrate` from has no IPv6 route, run it from one that does (a VM in
+the target region is ideal) or enable the IPv4 add-on for the migration window. `doctor`
+classifies each URL and tells you which situation you're in.
+
+## What this tool does NOT replicate — do this FIRST
+
+Logical replication moves **row data for the tables you list**, and nothing else. It does
+not carry DDL, roles, sequences-as-DDL, or the Supabase-managed `auth` / `storage` schemas.
+For a Supabase→Supabase move you must restore those onto the target **before** `replicate`,
+or the initial copy fails — `public.documents.user_id` has an FK into `auth.users`, so copying
+`documents` into a target with an empty `auth.users` is rejected row-by-row. `doctor` flags any
+such cross-schema FK.
+
+The Supabase-blessed dump/restore (see
+[Migrating within Supabase](https://supabase.com/docs/guides/platform/migrating-within-supabase/backup-restore))
+covers exactly the parts this tool skips:
+
+```bash
+# from the SOURCE (direct or session-pooler connection string)
+supabase db dump --db-url "$SOURCE_DB_URL" -f roles.sql  --role-only
+supabase db dump --db-url "$SOURCE_DB_URL" -f schema.sql                 # DDL: tables, RLS, functions
+supabase db dump --db-url "$SOURCE_DB_URL" -f auth.sql   --data-only --schema auth   # the 3 users etc.
+
+# on the TARGET, in order: roles -> schema -> auth data (triggers off during data load)
+psql --single-transaction --variable ON_ERROR_STOP=1 \
+  --file roles.sql --file schema.sql \
+  --command 'SET session_replication_role = replica' \
+  --file auth.sql --dbname "$TARGET_DB_URL"
+```
+
+Also enable any **non-default extensions** on the target first (example-app uses `pg_cron`,
+`pgcrypto`, `uuid-ossp`, `pg_stat_statements`, `hypopg`, `index_advisor`, `supabase_vault`) —
+`doctor` diffs source vs target extensions and lists the missing ones.
+
 ## Runbook
 
 ```bash
@@ -56,8 +96,12 @@ bun start doctor --source-only
 # 0b. read-only sanity — versions, wal_level, subscribe grant, replica identity
 bun start preflight
 
-# 1. load schema on the TARGET first (logical replication does NOT carry DDL).
-#    Skip the pg_cron schedule migration so the target doesn't delete independently:
+# 1. on the TARGET first (logical replication does NOT carry DDL):
+#    a) enable non-default extensions (see "What this tool does NOT replicate")
+#    b) restore roles + schema + auth/storage DATA via dump/restore (auth.users
+#       must exist before the copy or the documents FK rejects every row)
+#    c) load app schema. Skip the pg_cron schedule migration so the target
+#       doesn't run cleanup independently while both DBs are live:
 for f in $(ls path/to/supabase/migrations/*.sql | grep -v scheduled_jobs); do
   psql "$TARGET_DB_URL" -f "$f"
 done

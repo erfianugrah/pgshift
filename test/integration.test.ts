@@ -2,6 +2,7 @@ import { afterAll, beforeAll, describe, expect, test } from "bun:test";
 import { type Config, ConfigSchema, type Secrets, SecretsSchema } from "../src/config.ts";
 import { connect, type Db } from "../src/db.ts";
 import { runChaos } from "../src/rehearsal/chaos.ts";
+import { doctor } from "../src/steps/doctor.ts";
 import { preflight } from "../src/steps/preflight.ts";
 import { reconcile } from "../src/steps/reconcile.ts";
 import { replicate } from "../src/steps/replicate.ts";
@@ -126,5 +127,19 @@ d("live replication + reconciliation", () => {
     await createSchema(target);
     await runChaos({ source, target, arg: TABLE }, "drop-replica-identity");
     expect(preflight(source, target, cfg)).rejects.toThrow();
+  }, 60_000);
+
+  test("doctor: clean synced pair reports zero failures", async () => {
+    await resetAndSync(50);
+    const r = await doctor(cfg, secrets);
+    expect(r.fail).toBe(0);
+  }, 60_000);
+
+  test("doctor: missing target schema is a failure", async () => {
+    await teardown(source, target, cfg);
+    await createSchema(source);
+    await target.unsafe(`DROP TABLE IF EXISTS ${TABLE} CASCADE`);
+    const r = await doctor(cfg, secrets);
+    expect(r.fail).toBeGreaterThan(0);
   }, 60_000);
 });

@@ -25,6 +25,29 @@ export interface HashColumnDiff {
   generatedPinned: string[];
 }
 
+export interface Fk {
+  /** schema.table that has the FK */
+  table: string;
+  /** schema.table it references */
+  references: string;
+}
+
+/**
+ * Pure: of the tables we replicate, which OTHER schemas/tables do they FK into
+ * that we are NOT replicating? Those referenced rows must already exist on the
+ * target before the initial copy, or FK enforcement rejects the copied rows.
+ * The canonical case: public.documents.user_id → auth.users (Supabase-managed,
+ * migrated via dump/restore, not by this tool).
+ */
+export function externalDeps(fks: Fk[], replicated: string[]): string[] {
+  const set = new Set(replicated);
+  const out = new Set<string>();
+  for (const f of fks) {
+    if (set.has(f.table) && !set.has(f.references)) out.add(f.references);
+  }
+  return [...out].sort();
+}
+
 /** Pure: compare a reconcile table's pinned hashColumns against the live schema. */
 export function diffHashColumns(
   pinned: string[] | undefined,
@@ -212,6 +235,29 @@ async function sourceChecks(source: Db, cfg: Config, s: Sink): Promise<void> {
     }
   }
 
+  // cross-schema FK dependencies — the auth.users trap
+  const fkRows = await source`
+    SELECT (n.nspname || '.' || c.relname) AS tbl,
+           (fn.nspname || '.' || fc.relname) AS ref
+    FROM pg_constraint con
+    JOIN pg_class c ON c.oid = con.conrelid
+    JOIN pg_namespace n ON n.oid = c.relnamespace
+    JOIN pg_class fc ON fc.oid = con.confrelid
+    JOIN pg_namespace fn ON fn.oid = fc.relnamespace
+    WHERE con.contype = 'f'`;
+  const fks: Fk[] = fkRows.map((r) => ({ table: String(r.tbl), references: String(r.ref) }));
+  const deps = externalDeps(fks, cfg.replication.tables);
+  if (deps.length === 0) {
+    s.ok("no cross-schema FK dependencies among replicated tables");
+  } else {
+    for (const d of deps)
+      s.warn(
+        `replicated tables FK into ${d} (not replicated) — its data MUST exist on the target ` +
+          `before the initial copy, or FK enforcement rejects the rows. Migrate ${d.split(".")[0]} ` +
+          `via dump/restore (supabase db dump) first.`,
+      );
+  }
+
   // stale leftovers from a prior run
   const [slot] =
     await source`SELECT 1 FROM pg_replication_slots WHERE slot_name = ${cfg.replication.slot}`;
@@ -260,6 +306,25 @@ async function targetChecks(
   else if (tgtNum < 160000)
     s.warn("PG15 target + non-superuser — CREATE SUBSCRIPTION may be blocked; smoke-test it");
   else s.fail("target role lacks pg_create_subscription membership");
+
+  // non-default extensions present on source must be enabled on target before schema load
+  if (sourceReachable) {
+    const IGNORE = new Set(["plpgsql"]);
+    const [srcExt, tgtExt] = await Promise.all([
+      source`SELECT extname FROM pg_extension`,
+      target`SELECT extname FROM pg_extension`,
+    ]);
+    const tgtSet = new Set(tgtExt.map((e) => String(e.extname)));
+    const missing = srcExt
+      .map((e) => String(e.extname))
+      .filter((e) => !IGNORE.has(e) && !tgtSet.has(e))
+      .sort();
+    missing.length === 0
+      ? s.ok("target has all source extensions")
+      : s.warn(
+          `target missing source extensions (enable before schema load): ${missing.join(", ")}`,
+        );
+  }
 
   // is the schema loaded on the target yet? (logical replication does NOT carry DDL)
   for (const qt of cfg.replication.tables) {

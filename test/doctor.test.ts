@@ -1,6 +1,6 @@
 import { describe, expect, test } from "bun:test";
 import { classifyConn } from "../src/db.ts";
-import { diffHashColumns } from "../src/steps/doctor.ts";
+import { diffHashColumns, externalDeps, type Fk } from "../src/steps/doctor.ts";
 
 describe("classifyConn", () => {
   test("direct Supabase host → ref extracted, not pooler", () => {
@@ -32,6 +32,39 @@ describe("classifyConn", () => {
     const c = classifyConn("postgresql://u:p@source:5432/postgres");
     expect(c.isPooler).toBe(false);
     expect(c.isSupabaseDirect).toBe(false);
+  });
+});
+
+describe("externalDeps", () => {
+  const replicated = ["public.documents", "public.aliases"];
+  const fks: Fk[] = [
+    { table: "public.documents", references: "auth.users" },
+    { table: "public.aliases", references: "public.documents" },
+  ];
+
+  test("flags FK into a non-replicated schema (auth.users)", () => {
+    expect(externalDeps(fks, replicated)).toEqual(["auth.users"]);
+  });
+
+  test("intra-set FK (aliases→documents) is not an external dep", () => {
+    expect(
+      externalDeps([{ table: "public.aliases", references: "public.documents" }], replicated),
+    ).toEqual([]);
+  });
+
+  test("ignores FKs on tables we don't replicate", () => {
+    expect(externalDeps([{ table: "other.thing", references: "auth.users" }], replicated)).toEqual(
+      [],
+    );
+  });
+
+  test("dedups + sorts multiple external refs", () => {
+    const many: Fk[] = [
+      { table: "public.documents", references: "auth.users" },
+      { table: "public.aliases", references: "auth.users" },
+      { table: "public.documents", references: "storage.objects" },
+    ];
+    expect(externalDeps(many, replicated)).toEqual(["auth.users", "storage.objects"]);
   });
 });
 

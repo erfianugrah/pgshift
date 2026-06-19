@@ -7,6 +7,10 @@ the live source or the installed CLIs. Follow it top to bottom.
 If you only read one thing: **run `bun start doctor` at every gate and do not proceed past
 a `✗ NOT READY`.**
 
+Prerequisites (Bun, the `supabase` CLI, `psql`/`pg_dump`, Docker for the rehearsal) and
+install steps are in the README **Prerequisites** + **Getting started** sections — set those
+up before step 1.
+
 ---
 
 ## 0. Verified facts about this migration (do not re-derive)

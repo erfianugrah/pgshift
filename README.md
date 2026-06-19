@@ -35,15 +35,44 @@ A cross-region migration is ~7 independent workstreams. Most are already covered
 - **Teardown order** → disable → `SET (slot_name = NONE)` → drop subscription → drop slot → drop publication, or it hangs.
 - **Never re-enable writes on the source** after cutover (split-brain) — `cutover` says so.
 
-## Setup
+## Prerequisites
+
+| Tool | Version | Needed for |
+|---|---|---|
+| [Bun](https://bun.sh) | ≥ 1.3 | runs the CLI directly from TypeScript — **no build step**, `sbmigrate` = `bun run src/cli.ts` |
+| `supabase` CLI | ≥ 2.x | `config-sync`, `functions`, `storage`, and the auth/roles/schema dump-restore pre-step |
+| `psql` + `pg_dump` | ≥ 15 (17 matches the source) | restoring roles/schema/auth onto the target; loading migrations |
+| Docker + `docker compose` | v2 | **only** for the rehearsal harness and `test:integration` — not for a real migration |
+
+Node.js is **not** required. The replication host must be able to reach the **direct**
+Postgres hosts (IPv6, or the IPv4 add-on) — see the connection note below.
+
+Runtime dependencies (installed by `bun install`): `commander` (CLI), `postgres` (the pg
+client), `yaml` (config), `zod` (config validation). Dev: `@biomejs/biome`, `typescript`,
+`@types/bun`.
+
+## Getting started
 
 ```bash
-bun install
-cp migrate.config.example.yaml migrate.config.yaml   # edit refs + tables
+git clone <repo> && cd supabase-region-migrate
+bun install                                           # commander, postgres, yaml, zod
+cp migrate.config.example.yaml migrate.config.yaml    # set source/target refs + tables
 cp .env.example .env                                  # DIRECT connection strings + PAT
+
+bun start doctor --source-only                        # verify readiness (no target needed yet)
 ```
 
-Secrets live only in `.env` (connection strings, access token). The YAML is non-secret and commit-safe.
+Secrets live only in `.env` (connection strings, access token). The YAML is non-secret and
+commit-safe. Then follow the step-by-step **[`docs/RUNBOOK.md`](docs/RUNBOOK.md)**.
+
+Development:
+
+```bash
+bun test                  # unit suite (fast, no DB)
+bun run test:integration  # live replication/reconcile vs a throwaway Postgres pair (needs Docker)
+bun run typecheck         # tsc --noEmit
+bun run check             # biome format + lint
+```
 
 ### Connection: direct vs pooler (IPv6 trap)
 

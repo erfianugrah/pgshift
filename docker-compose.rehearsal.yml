@@ -1,0 +1,84 @@
+# Scale rehearsal harness: a throwaway source + target (example-app-shaped schema)
+# plus a persistent bun runner, all on one network. NEVER points at a real
+# Supabase project — this is for emulating prod scale (e.g. ~large) on disposable
+# local Postgres.
+#
+#   docker compose -f docker-compose.rehearsal.yml up -d
+#   docker compose -f docker-compose.rehearsal.yml exec -T runner \
+#       bun start -c migrate.config.example.yaml doctor
+#   ... seed-size / replicate / watch / reconcile via the runner ...
+#   docker compose -f docker-compose.rehearsal.yml down -v
+#
+# The runner uses service-DNS names (source:5432 / target:5432) so the
+# subscription's CONNECTION resolves the same from the runner and from the
+# target's walreceiver. Host ports 55432/55433 are published for monitoring only.
+
+name: sbmigrate-rehearsal
+
+services:
+  source:
+    image: postgres:16
+    command:
+      - postgres
+      - -c
+      - wal_level=logical
+      - -c
+      - max_wal_senders=10
+      - -c
+      - max_replication_slots=10
+      - -c
+      - max_wal_size=8GB           # fewer checkpoints during the big seed
+      - -c
+      - checkpoint_timeout=30min
+      - -c
+      - maintenance_work_mem=1GB
+    environment:
+      POSTGRES_PASSWORD: pw
+    ports: ["55432:5432"]
+    volumes:
+      - ./test/rehearsal-schema.sql:/docker-entrypoint-initdb.d/schema.sql:ro
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U postgres -d postgres"]
+      interval: 2s
+      timeout: 3s
+      retries: 30
+
+  target:
+    image: postgres:16
+    command:
+      - postgres
+      - -c
+      - max_wal_size=8GB
+      - -c
+      - checkpoint_timeout=30min
+      - -c
+      - max_logical_replication_workers=8
+      - -c
+      - max_worker_processes=16
+      - -c
+      - maintenance_work_mem=1GB
+    environment:
+      POSTGRES_PASSWORD: pw
+    ports: ["55433:5432"]
+    volumes:
+      - ./test/rehearsal-schema.sql:/docker-entrypoint-initdb.d/schema.sql:ro
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U postgres -d postgres"]
+      interval: 2s
+      timeout: 3s
+      retries: 30
+
+  runner:
+    image: oven/bun:1
+    working_dir: /app
+    volumes:
+      - ./:/app
+    environment:
+      SOURCE_DB_URL: postgresql://postgres:pw@source:5432/postgres
+      TARGET_DB_URL: postgresql://postgres:pw@target:5432/postgres
+    depends_on:
+      source:
+        condition: service_healthy
+      target:
+        condition: service_healthy
+    command: ["sh", "-c", "bun install --frozen-lockfile && sleep infinity"]

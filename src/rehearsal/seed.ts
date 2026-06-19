@@ -10,6 +10,13 @@ import { log } from "../log.ts";
  *
  * expires_at is far-future (cron cleanup won't touch test data); user_id NULL
  * (no auth.users dependency).
+ *
+ * Payload = space-separated random md5 tokens, NOT repeat() of a single md5.
+ * `repeat(md5(...), N)` is one 32-char string repeated, which TOAST compresses
+ * ~1000:1 — a byte-size target would never be reached and on-disk size would be
+ * nothing like the prod shape. Distinct per-chunk md5s are high-entropy (~no
+ * compression), and the spaces keep every token short enough that a generated
+ * `search_vector` tsvector seeds without "word is too long to be indexed".
  */
 export async function seedToSize(
   source: Db,
@@ -17,15 +24,15 @@ export async function seedToSize(
 ): Promise<void> {
   const gib = (opts.targetBytes / 1_073_741_824).toFixed(2);
   log.step(`seed documents to ~${gib} GiB (batch=${opts.batchRows}, conc=${opts.concurrency})`);
-  const repeat = Math.max(1, Math.floor(opts.payloadBytes / 32));
+  const chunks = Math.max(1, Math.floor(opts.payloadBytes / 33)); // 32-char token + 1 space
 
   const insertBatch = async (db: Db) => {
     await db.unsafe(
       `INSERT INTO public.documents (content, title, language, expires_at, visibility)
-       SELECT repeat(md5(random()::text), $1), 'seed', 'text',
-              now() + interval '10 years', 'public'
+       SELECT (SELECT string_agg(md5(random()::text), ' ') FROM generate_series(1, $1)),
+              'seed', 'text', now() + interval '10 years', 'public'
        FROM generate_series(1, $2)`,
-      [repeat, opts.batchRows],
+      [chunks, opts.batchRows],
     );
   };
 
@@ -55,13 +62,13 @@ export async function seedToSize(
 /** Legacy row-count seed (small correctness runs). */
 export async function seed(source: Db, rows: number, payloadBytes: number): Promise<void> {
   log.step(`seed ${rows} rows (~${payloadBytes}B each)`);
-  const repeat = Math.max(1, Math.floor(payloadBytes / 32));
+  const chunks = Math.max(1, Math.floor(payloadBytes / 33));
   await source.unsafe(
     `INSERT INTO public.documents (content, title, language, expires_at, visibility)
-     SELECT repeat(md5(random()::text), $1), 'seed ' || g, 'text',
+     SELECT (SELECT string_agg(md5(random()::text), ' ') FROM generate_series(1, $1)), 'seed ' || g, 'text',
             now() + interval '10 years', 'public'
      FROM generate_series(1, $2) g`,
-    [repeat, rows],
+    [chunks, rows],
   );
   const [c] = await source`SELECT count(*)::bigint AS n FROM public.documents`;
   log.ok(`seeded — documents now has ${c?.n} rows`);

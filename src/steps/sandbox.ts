@@ -21,7 +21,7 @@
 import { randomBytes } from "node:crypto";
 import { existsSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { parseEnvFile } from "../config.ts";
-import { connect } from "../db.ts";
+import { connect, type Db } from "../db.ts";
 import { log } from "../log.ts";
 import type { MgmtApi } from "../mgmt.ts";
 import { seed } from "../rehearsal/seed.ts";
@@ -61,38 +61,27 @@ function randPw(): string {
 
 const sleep = (ms: number) => new Promise((r) => setTimeout(r, ms));
 
+type Conns = { SOURCE_DB_URL: string; TARGET_DB_URL: string; SOURCE_REPLICATION_URL?: string };
+
 /**
- * Load the sandbox schema + seed, retrying the FIRST connection. A project can
- * report ACTIVE_HEALTHY before the Supavisor pooler has registered its tenant
- * (`tenant/user postgres.<ref> not found` / ENOTFOUND), so the pooler URL is
- * briefly unusable. Retry with backoff instead of a fixed grace sleep.
+ * Acquire a working SOURCE connection, retrying ONLY the connection probe. A
+ * project can report ACTIVE_HEALTHY before the Supavisor pooler has registered
+ * its tenant (`tenant/user postgres.<ref> not found` / ENOTFOUND), so the pooler
+ * URL is briefly unusable. We retry the probe — recreating the client each time,
+ * since a client bound to a not-yet-ready tenant can stay poisoned — and return
+ * the first live connection. Seeding then runs ONCE on it (NOT inside the retry),
+ * so a transient mid-seed error can never double-insert.
  */
-async function seedSource(
-  conns: { SOURCE_DB_URL: string; TARGET_DB_URL: string; SOURCE_REPLICATION_URL?: string },
+async function acquireSource(
+  conns: Conns,
   token: string,
-  rows: number,
-  payloadBytes: number,
-): Promise<void> {
-  const schemaSql = readFileSync(SCHEMA, "utf8");
+): Promise<{ source: Db; close: () => Promise<void> }> {
   const maxAttempts = 18; // ~3 min of 10s polls
   for (let attempt = 1; attempt <= maxAttempts; attempt++) {
     const { source, close } = connect({ ...conns, SUPABASE_ACCESS_TOKEN: token });
     try {
-      await source`SELECT 1`; // probe — fails until the pooler tenant resolves
-      log.step("loading sandbox schema on the SOURCE");
-      await source.unsafe(schemaSql);
-      log.step(`seeding source (${rows.toLocaleString()} documents)`);
-      await seed(source, rows, payloadBytes);
-      // Seed the IDENTITY table too so its owned sequence advances — this is
-      // what makes the cutover sequence-resync observable.
-      await source.unsafe(
-        `INSERT INTO public.items (title) SELECT 'item ' || g FROM generate_series(1, $1) g`,
-        [Math.max(1, Math.floor(rows / 10))],
-      );
-      const [c] = await source`SELECT count(*)::bigint AS n FROM public.items`;
-      log.ok(`seeded documents + ${c?.n} items (IDENTITY sequence ready for the cutover demo)`);
-      await close();
-      return;
+      await source`SELECT 1`; // fails until the pooler tenant resolves
+      return { source, close };
     } catch (e) {
       await close();
       const msg = e instanceof Error ? e.message : String(e);
@@ -103,6 +92,33 @@ async function seedSource(
       log.detail(`source not reachable yet (${msg}); retry ${attempt}/${maxAttempts} in 10s`);
       await sleep(10_000);
     }
+  }
+  throw new Error("unreachable");
+}
+
+/** Load the sandbox schema + seed it. Runs EXACTLY ONCE on a live connection. */
+async function seedSource(
+  conns: Conns,
+  token: string,
+  rows: number,
+  payloadBytes: number,
+): Promise<void> {
+  const { source, close } = await acquireSource(conns, token);
+  try {
+    log.step("loading sandbox schema on the SOURCE");
+    await source.unsafe(readFileSync(SCHEMA, "utf8"));
+    log.step(`seeding source (${rows.toLocaleString()} documents)`);
+    await seed(source, rows, payloadBytes);
+    // Seed the IDENTITY table too so its owned sequence advances — this is what
+    // makes the cutover sequence-resync observable.
+    await source.unsafe(
+      `INSERT INTO public.items (title) SELECT 'item ' || g FROM generate_series(1, $1) g`,
+      [Math.max(1, Math.floor(rows / 10))],
+    );
+    const [c] = await source`SELECT count(*)::bigint AS n FROM public.items`;
+    log.ok(`seeded documents + ${c?.n} items (IDENTITY sequence ready for the cutover demo)`);
+  } finally {
+    await close();
   }
 }
 
@@ -124,6 +140,10 @@ function connsFromEnvFile(): {
 function readState(): SandboxState | null {
   if (!existsSync(STATE_FILE)) return null;
   return JSON.parse(readFileSync(STATE_FILE, "utf8")) as SandboxState;
+}
+
+function writeState(state: SandboxState): void {
+  writeFileSync(STATE_FILE, `${JSON.stringify(state, null, 2)}\n`);
 }
 
 function renderConfig(state: SandboxState): string {
@@ -179,9 +199,16 @@ SUPABASE_ACCESS_TOKEN=${token}
 export async function sandboxUp(api: MgmtApi, token: string, opts: SandboxUpOpts): Promise<void> {
   const existing = readState();
   let state: SandboxState;
-  let conns: { SOURCE_DB_URL: string; TARGET_DB_URL: string; SOURCE_REPLICATION_URL?: string };
+  let conns: Conns;
 
   if (existing) {
+    if (!existing.tgtRef) {
+      throw new Error(
+        `a previous \`sandbox up\` was interrupted before the target was created ` +
+          `(only src=${existing.srcRef} exists). Run \`pgshift sandbox down\` to delete it, ` +
+          `then \`sandbox up\` again.`,
+      );
+    }
     // Resume: a prior `up` created the pair but didn't finish seeding (e.g. the
     // pooler tenant wasn't ready). Reuse the projects + generated files.
     log.step(`sandbox up — resuming src=${existing.srcRef} tgt=${existing.tgtRef}`);
@@ -192,21 +219,23 @@ export async function sandboxUp(api: MgmtApi, token: string, opts: SandboxUpOpts
     log.step(`sandbox up — creating throwaway pair (src=${opts.srcRegion} tgt=${opts.tgtRegion})`);
     const srcPw = randPw();
     const tgtPw = randPw();
-    const [srcRef, tgtRef] = await Promise.all([
-      api.createProject("pgshift-sandbox-src", opts.org, srcPw, opts.srcRegion),
-      api.createProject("pgshift-sandbox-tgt", opts.org, tgtPw, opts.tgtRegion),
-    ]);
-    log.ok(`src=${srcRef}  tgt=${tgtRef}`);
-
-    state = {
+    const createdAt = new Date().toISOString();
+    // Create SEQUENTIALLY and persist state after EACH ref is known, so
+    // `sandbox down` can always delete whatever exists — even if the second
+    // create (or a crash) follows the first. Promise.all would reject both-or-
+    // nothing and orphan a created project with no state file.
+    const srcRef = await api.createProject("pgshift-sandbox-src", opts.org, srcPw, opts.srcRegion);
+    writeState({
       srcRef,
-      tgtRef,
+      tgtRef: "",
       srcRegion: opts.srcRegion,
       tgtRegion: opts.tgtRegion,
-      createdAt: new Date().toISOString(),
-    };
-    // Persist state immediately so `sandbox down` can clean up even if the rest fails.
-    writeFileSync(STATE_FILE, `${JSON.stringify(state, null, 2)}\n`);
+      createdAt,
+    });
+    const tgtRef = await api.createProject("pgshift-sandbox-tgt", opts.org, tgtPw, opts.tgtRegion);
+    state = { srcRef, tgtRef, srcRegion: opts.srcRegion, tgtRegion: opts.tgtRegion, createdAt };
+    writeState(state);
+    log.ok(`src=${srcRef}  tgt=${tgtRef}`);
 
     log.step("waiting for ACTIVE_HEALTHY (~2-4 min)");
     await api.waitHealthy([srcRef, tgtRef], { pollSec: 15, timeoutMin: 12 });
@@ -268,14 +297,13 @@ export async function sandboxDown(api: MgmtApi): Promise<void> {
     log.info("no sandbox to tear down");
     return;
   }
-  log.step(`sandbox down — deleting ${state.srcRef} + ${state.tgtRef}`);
-  const results = await Promise.allSettled([
-    api.deleteProject(state.srcRef).then(() => log.ok(`deleted ${state.srcRef}`)),
-    api.deleteProject(state.tgtRef).then(() => log.ok(`deleted ${state.tgtRef}`)),
-  ]);
+  const refs = [state.srcRef, state.tgtRef].filter(Boolean);
+  log.step(`sandbox down — deleting ${refs.join(" + ")}`);
+  const results = await Promise.allSettled(
+    refs.map((ref) => api.deleteProject(ref).then(() => log.ok(`deleted ${ref}`))),
+  );
   results.forEach((r, i) => {
-    if (r.status === "rejected")
-      log.warn(`delete ${i === 0 ? state.srcRef : state.tgtRef} failed: ${String(r.reason)}`);
+    if (r.status === "rejected") log.warn(`delete ${refs[i]} failed: ${String(r.reason)}`);
   });
   for (const f of [STATE_FILE, CONFIG_FILE, ENV_FILE]) {
     if (existsSync(f)) {

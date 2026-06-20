@@ -71,9 +71,8 @@ program.hook("preAction", (thisCommand, actionCommand) => {
             `(the file wins — pass --no-env-file to use the inherited values instead)`,
         );
     } else if (explicit) {
-      log.err(`--env-file ${path} not found`);
-      process.exitCode = 1;
-      throw new Error(`env file not found: ${path}`);
+      // single throw — parseAsync's .catch logs it (no double log.err here)
+      throw new Error(`--env-file ${path} not found`);
     }
   }
   if (opts.logFile === false) return; // --no-log-file

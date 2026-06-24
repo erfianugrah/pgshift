@@ -1,5 +1,28 @@
 import { z } from "zod";
 
+/** Where a knowledge item's guidance came from, and when it was last reconciled. Shared by
+ *  every item type so `kb drift` can age-check them uniformly. */
+export const Provenance = z.object({
+  /** docs.erfi.io path (preferred — drift-checkable via docs_grep) or vendor URL. */
+  source: z.string().min(1),
+  /** ISO date (YYYY-MM-DD) the guidance was last reconciled against `source`. */
+  lastSynced: z.string().regex(/^\d{4}-\d{2}-\d{2}$/, "lastSynced must be YYYY-MM-DD"),
+});
+export type Provenance = z.infer<typeof Provenance>;
+
+/** Migration phase an item belongs to (docs/GUIDED-MIGRATION.md §4, plus `target-prep`). */
+export const Phase = z.enum([
+  "preflight",
+  "source-prep",
+  "target-prep",
+  "snapshot",
+  "cdc",
+  "reconcile",
+  "cutover",
+  "teardown",
+]);
+export type Phase = z.infer<typeof Phase>;
+
 /**
  * A unit of migration knowledge, promoted from inline control flow to validated data.
  *
@@ -35,14 +58,40 @@ export const ProviderHintItem = z.object({
   klass: z.enum(["auto", "assisted", "guided", "informed"]),
   /** The exact remediation text doctor prints (kept verbatim — tests assert substrings). */
   guidance: z.string().min(1),
-  provenance: z.object({
-    /** docs.erfi.io path (preferred — drift-checkable via docs_grep) or vendor URL. */
-    source: z.string().min(1),
-    /** ISO date (YYYY-MM-DD) the guidance was last reconciled against `source`. */
-    lastSynced: z.string().regex(/^\d{4}-\d{2}-\d{2}$/, "lastSynced must be YYYY-MM-DD"),
-  }),
+  provenance: Provenance,
 });
 export type ProviderHintItem = z.infer<typeof ProviderHintItem>;
 
 /** A validated list of provider-hint knowledge items. */
 export const ProviderHints = z.array(ProviderHintItem);
+
+/**
+ * A live readiness check, promoted from doctor's inline control flow to data: a single-row
+ * SQL probe of one observed value, an expected value to compare it against, plus the phase /
+ * severity / remediation / provenance metadata. doctor executes these against a connection
+ * (keeping its existing render strings); `guide`'s future live walk runs the same items.
+ * docs/GUIDED-MIGRATION.md §4, §10.1.
+ */
+export const CheckItem = z.object({
+  /** Stable id, e.g. "source.wal_level_logical". */
+  id: z.string().min(1),
+  phase: Phase,
+  /** fail gates the phase; warn/info are advisory. */
+  severity: z.enum(["fail", "warn", "info"]),
+  /** Short human label, e.g. "source wal_level". */
+  title: z.string().min(1),
+  /** A probe returning a single row; `column` names the observed value within it. */
+  detect: z.object({
+    sql: z.string().min(1),
+    column: z.string().min(1),
+  }),
+  /** The string `detect.column` must equal for the check to pass. */
+  expect: z.string(),
+  /** Verbose remediation (the `guide` surface; doctor keeps its own terse line). */
+  guidance: z.string().min(1),
+  provenance: Provenance,
+});
+export type CheckItem = z.infer<typeof CheckItem>;
+
+/** A validated list of check items. */
+export const Checks = z.array(CheckItem);

@@ -1,5 +1,6 @@
 import type { Config, Secrets } from "../config.ts";
 import { classifyConn, connect, type Db, type PgProvider } from "../db.ts";
+import { check, runCheck } from "../kb/checks.ts";
 import { lookupProviderHint } from "../kb/provider-hints.ts";
 import { log } from "../log.ts";
 import { extensionStatements, missingExtensions } from "./bootstrap.ts";
@@ -250,10 +251,10 @@ function reachHint(error: string | undefined, c: ReturnType<typeof classifyConn>
 async function sourceChecks(source: Db, cfg: Config, s: Sink): Promise<void> {
   log.step("doctor: source readiness");
 
-  const [wal] = await source`SHOW wal_level`;
-  wal?.wal_level === "logical"
+  const wal = await runCheck((sql) => source.unsafe(sql), check("source.wal_level_logical"));
+  wal.ok
     ? s.ok("source wal_level=logical")
-    : s.fail(`source wal_level=${wal?.wal_level} (need 'logical')`);
+    : s.fail(`source wal_level=${wal.observed} (need 'logical')`);
 
   // replica identity per published table
   for (const qt of cfg.replication.tables) {

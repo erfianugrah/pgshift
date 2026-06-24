@@ -35,7 +35,7 @@ you wrap an engine that already did. The eight pieces:
 |---|---|---|---|
 | 1 | Source CDC capture | MySQL/Aurora-MySQL binlog (ROW); PlanetScale Vitess **VStream**; SQL Server / Azure SQL CDC change-tables; Oracle LogMiner/XStream | **wrap (Debezium)** |
 | 2 | Normalized change envelope | op + before/after row image + source position (GTID/LSN) | **wrap (Debezium)** |
-| 3 | Type mapping matrix | `TINYINT(1)`→bool, unsigned ints, ENUM/SET, zero-dates, fractional-second precision, generated columns, spatial; SQL Server `UNIQUEIDENTIFIER`→uuid, BIT, MONEY, DATETIME2, collations | **wrap (Debezium) + `guided` review** — MySQL matrix DONE (`schema-translate.ts`); SQL Server pending |
+| 3 | Type mapping matrix | `TINYINT(1)`→bool, unsigned ints, ENUM/SET, zero-dates, fractional-second precision, generated columns, spatial; SQL Server `UNIQUEIDENTIFIER`→uuid, BIT, MONEY, DATETIME2, IDENTITY, ROWVERSION, collations | **wrap (Debezium) + `guided` review** — MySQL matrix DONE (`schema-translate.ts`); SQL Server matrix DONE (`sqlserver-schema-translate.ts`) |
 | 4 | Schema/DDL translation | source DDL → Postgres DDL | **own — the long pole; see GUIDED-MIGRATION §7** |
 | 5 | Consistent snapshot + position | MySQL consistent-snapshot txn + GTID; SQL Server snapshot isolation + LSN; then `COPY` | **wrap (Debezium snapshot)** |
 | 6 | Apply loop into Postgres | ordering, idempotency, batching | **wrap (Debezium JDBC/PG sink)** |
@@ -187,12 +187,28 @@ Source priority by demand: MySQL / Aurora-MySQL first, then SQL Server / Azure S
 SQL Server connector), then MongoDB (document→relational, a separate sub-project), Oracle
 last.
 
-## 6. SQL Server / Azure SQL notes (the second engine)
+## 6. SQL Server / Azure SQL notes (the second engine) — DELIVERED 2026-06-24
+
+The SQL Server engine is implemented end-to-end and forks cleanly off `cfg.source.engine`:
+
+- **client** — `src/engine/sqlserver.ts` (mssql-backed `SqlServerConn`, mirrors `mysql.ts`).
+- **config** — `debezium-config.ts` renders the `SqlServerConnector` (CDC change-tables,
+  `database.names`, `database.encrypt`, 4-segment RegexRouter) off the discriminated source union.
+- **schema translation** — `src/engine/sqlserver-schema-translate.ts` (the §7b long pole: full
+  T-SQL matrix incl. fractional-second precision cap at 6, DATETIME→timestamp tz review, the
+  ROWVERSION trap, IDENTITY + COMPUTED overlays, spatial/`sql_variant` design decisions). Wired
+  into `pgshift translate`.
+- **engine lifecycle** — `DebeziumEngine` replicate/watch/reconcile/cutover/teardown are
+  engine-aware: bracket `[schema].[table]` quoting + `LEN`, the sqlserver reconcile dialect, and
+  a **CDC-`max_lsn` write-stop gate** (`sys.fn_cdc_get_max_lsn`) in place of the binlog position.
+- **doctor** — the engine-prep playbook runs LIVE for SQL Server (EngineEdition CDC-capable +
+  `is_cdc_enabled` asserts).
+- **harness** — `test/heterogeneous/harness-sqlserver.ts` + `docker-compose.sqlserver.yml`.
 
 The Debezium **SQL Server connector** captures from SQL Server **CDC change-tables**, not a
 binlog — so the source-prep playbook (see [`GUIDED-MIGRATION.md`](GUIDED-MIGRATION.md) §7b)
 must enable CDC first (`sys.sp_cdc_enable_db` + per-table `sys.sp_cdc_enable_table`). Engine
-notes that shape the `debezium` impl for this source:
+notes that shaped the `debezium` impl for this source:
 
 - **Azure SQL Database tier gate** — CDC needs a vCore tier (any) or DTU **S3+**; Basic/S0/S1/S2
   can't be a source. `doctor`/`guide` must detect tier and fail early, not at connector start.

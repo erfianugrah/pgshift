@@ -4,6 +4,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { type Config, ConfigSchema, type Secrets } from "../src/config.ts";
 import type { MySqlConn } from "../src/engine/mysql.ts";
+import type { SqlServerConn } from "../src/engine/sqlserver.ts";
 import {
   assertSchemaSignedOff,
   buildManifest,
@@ -161,7 +162,7 @@ describe("translate — write artifacts", () => {
     );
   });
 
-  test("rejects a sqlserver source (not implemented)", async () => {
+  test("drafts a SQL Server source via the T-SQL translator + injected connector", async () => {
     const cfg = ConfigSchema.parse({
       source: { engine: "sqlserver", databases: ["dbo"] },
       target: { ref: "ss-target-ref-000000" },
@@ -169,7 +170,44 @@ describe("translate — write artifacts", () => {
       reconcile: { tables: [{ name: "dbo.customers" }] },
       watchdog: {},
     });
-    await expect(translate(cfg, secrets, { outDir: tmp() })).rejects.toThrow(/not implemented/);
+    let closed = false;
+    const conn: SqlServerConn = {
+      // biome-ignore lint/suspicious/noExplicitAny: test double returns shaped rows
+      async query<T = any>(text: string): Promise<T[]> {
+        if (text.includes("TABLE_CONSTRAINTS")) return [{ COLUMN_NAME: "id" }] as T[];
+        if (text.includes("INFORMATION_SCHEMA.COLUMNS")) {
+          return [
+            {
+              COLUMN_NAME: "id",
+              DATA_TYPE: "int",
+              IS_NULLABLE: "NO",
+              CHARACTER_MAXIMUM_LENGTH: null,
+              NUMERIC_PRECISION: 10,
+              NUMERIC_SCALE: 0,
+              DATETIME_PRECISION: null,
+              IS_IDENTITY: 1,
+              IS_COMPUTED: 0,
+            },
+          ] as T[];
+        }
+        return [] as T[];
+      },
+      async end() {
+        closed = true;
+      },
+    };
+    const out = tmp();
+    const res = await translate(cfg, secrets, { outDir: out, sqlServerConnect: async () => conn });
+    expect(res.draft.sql).toContain('CREATE TABLE IF NOT EXISTS "public"."customers"');
+    expect(res.draft.sql).toContain('"id" integer NOT NULL');
+    expect(res.manifest.source.engine).toBe("sqlserver");
+    expect(res.draft.decisions).toContainEqual({
+      table: "customers",
+      column: "id",
+      review: expect.stringMatching(/IDENTITY/),
+    });
+    expect(closed).toBe(true);
+    expect(readFileSync(res.paths.sql, "utf8")).toContain("from sqlserver dbo");
   });
 
   test("--apply without a target connection throws", async () => {

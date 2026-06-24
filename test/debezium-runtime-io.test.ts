@@ -17,6 +17,7 @@ import {
   debeziumVolumeRmArgv,
 } from "../src/engine/debezium-runspec.ts";
 import type { MySqlConn } from "../src/engine/mysql.ts";
+import type { SqlServerConn } from "../src/engine/sqlserver.ts";
 import { buildManifest, schemaArtifactPaths, signOffSchema } from "../src/steps/translate.ts";
 
 // biome-ignore lint/suspicious/noExplicitAny: opaque Db sentinels — debezium never touches them
@@ -312,7 +313,7 @@ describe("DebeziumEngine.cutover (mock source + fake target)", () => {
     const { io, calls } = mockIO();
     await expect(
       new DebeziumEngine(io, async () => my.conn).cutover(NODB, fakeTarget({}), cfg, { outDir }),
-    ).rejects.toThrow(/binlog still advancing/);
+    ).rejects.toThrow(/binlog position still advancing/);
     // never stopped the container — gate failed closed
     expect(calls.exec.find((a) => a[1] === "stop")).toBeUndefined();
   });
@@ -392,4 +393,115 @@ describe("DebeziumEngine.watch (mock source + fake target)", () => {
       new DebeziumEngine(io, async () => my.conn).watch(NODB, target, cfg),
     ).rejects.toThrow(/connector reports DOWN/);
   });
+});
+
+// ── SQL Server engine forks (mock mssql source + fake PG target) ───────────────────────────────
+
+const sqlServerCfg = () =>
+  ConfigSchema.parse({
+    source: { engine: "sqlserver", databases: ["inventory"] },
+    target: { ref: "bbbbbbbbbbbbbbbbbbbb" },
+    replication: { tables: ["dbo.customers"], publication: "dbz" },
+    reconcile: { tables: [{ name: "dbo.customers" }] },
+    watchdog: {},
+  });
+
+/** A fake SqlServerConn routing by SQL substring (same shape as the MySQL fake). */
+function fakeSqlServer(route: (sql: string) => unknown[]): {
+  conn: SqlServerConn;
+  ended: () => boolean;
+} {
+  let ended = false;
+  return {
+    conn: {
+      query: async <T>(sql: string) => route(sql) as T[],
+      end: async () => {
+        ended = true;
+      },
+    },
+    ended: () => ended,
+  };
+}
+
+describe("DebeziumEngine — SQL Server source forks", () => {
+  const cfg = sqlServerCfg();
+  const origUrl = process.env.SOURCE_DB_URL;
+
+  test("replicate stages the SQL Server CDC connector config", async () => {
+    process.env.SOURCE_DB_URL = "sqlserver://sa:pw@mssqlhost:1433/inventory";
+    const { io, calls } = mockIO({ healthyAfter: 1 });
+    await new DebeziumEngine(io).replicate(NODB, NODB, cfg, secrets());
+    expect(calls.writes[0]?.content).toContain(
+      "io.debezium.connector.sqlserver.SqlServerConnector",
+    );
+    expect(calls.writes[0]?.content).toContain("debezium.source.database.names=inventory");
+  });
+
+  test("reconcile scans the source with [bracket] quoting and the sqlserver dialect", async () => {
+    process.env.SOURCE_DB_URL = "sqlserver://sa:pw@mssqlhost:1433/inventory";
+    let sourceSql = "";
+    const ss = fakeSqlServer((sql) => {
+      if (/count\(\*\)|FROM \[/i.test(sql) || sql.includes("rowcount")) {
+        sourceSql = sql;
+        return [aggRow("5")];
+      }
+      return [];
+    });
+    const target = fakeTarget({
+      template: (sql) => (sql.includes("information_schema.columns") ? AGG_COLS : []),
+      unsafe: (sql) => (sql.includes("rowcount") ? [aggRow("5")] : []),
+    });
+    const { io } = mockIO();
+    const ok = await new DebeziumEngine(io, undefined, async () => ss.conn).reconcile(
+      NODB,
+      target,
+      cfg,
+    );
+    expect(ok).toBe(true);
+    expect(ss.ended()).toBe(true);
+    expect(sourceSql).toContain("FROM [dbo].[customers]"); // bracket-quoted, not backticks
+    expect(sourceSql).toContain("LEN("); // sqlserver char-length fn
+  });
+
+  test("cutover write-stop gate uses the CDC max LSN and refuses when it advances", async () => {
+    process.env.SOURCE_DB_URL = "sqlserver://sa:pw@mssqlhost:1433/inventory";
+    const outDir = signedSchemaDir(cfg as unknown as ReturnType<typeof mysqlCfg>);
+    let probes = 0;
+    const ss = fakeSqlServer((sql) => {
+      if (/fn_cdc_get_max_lsn/i.test(sql)) {
+        probes++;
+        return [{ lsn: new Uint8Array([0, 0, 0, probes]) }]; // advances each call
+      }
+      return [];
+    });
+    const { io, calls } = mockIO();
+    await expect(
+      new DebeziumEngine(io, undefined, async () => ss.conn).cutover(NODB, fakeTarget({}), cfg, {
+        outDir,
+      }),
+    ).rejects.toThrow(/CDC max LSN still advancing/);
+    expect(calls.exec.find((a) => a[1] === "stop")).toBeUndefined();
+  });
+
+  test("cutover drains + stops CDC when the max LSN is stable (writes stopped)", async () => {
+    process.env.SOURCE_DB_URL = "sqlserver://sa:pw@mssqlhost:1433/inventory";
+    const outDir = signedSchemaDir(cfg as unknown as ReturnType<typeof mysqlCfg>);
+    const ss = fakeSqlServer((sql) => {
+      if (/fn_cdc_get_max_lsn/i.test(sql)) return [{ lsn: new Uint8Array([0, 0, 0, 9]) }]; // stable
+      if (/count\(\*\)/i.test(sql)) return [{ n: "5" }];
+      return [];
+    });
+    const target = fakeTarget({
+      template: () => [], // no owned sequences
+      unsafe: (sql) => (sql.includes("count(*)") ? [{ n: "5" }] : []),
+    });
+    const { io, calls } = mockIO();
+    await new DebeziumEngine(io, undefined, async () => ss.conn).cutover(NODB, target, cfg, {
+      outDir,
+    });
+    expect(calls.exec).toContainEqual(debeziumStopArgv("pgshift-dbz-dbz"));
+  });
+
+  if (origUrl === undefined) delete process.env.SOURCE_DB_URL;
+  else process.env.SOURCE_DB_URL = origUrl;
 });

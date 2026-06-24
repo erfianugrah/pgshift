@@ -1,6 +1,7 @@
 import { describe, expect, test } from "bun:test";
 import { type Config, ConfigSchema, type Secrets } from "../src/config.ts";
 import type { MySqlConn } from "../src/engine/mysql.ts";
+import type { SqlServerConn } from "../src/engine/sqlserver.ts";
 import { log } from "../src/log.ts";
 import { doctor } from "../src/steps/doctor.ts";
 
@@ -89,6 +90,74 @@ describe("doctor — heterogeneous MySQL source (live engine-prep checks)", () =
       sourceOnly: true,
       mysqlConnect: async () => {
         throw new Error("ECONNREFUSED 127.0.0.1:3306");
+      },
+    });
+    expect(r.fail).toBe(1);
+  });
+});
+
+const sqlServerCfg = (): Config =>
+  ConfigSchema.parse({
+    source: { engine: "sqlserver", databases: ["inventory"] },
+    target: { ref: "doctor-het-target-ref0" },
+    replication: { tables: ["dbo.customers"], publication: "t" },
+    reconcile: { tables: [{ name: "dbo.customers" }] },
+    watchdog: {},
+  });
+
+const ssSecrets = (): Secrets =>
+  ({
+    SOURCE_DB_URL: "sqlserver://sa:pw@127.0.0.1:1433/inventory",
+    TARGET_DB_URL: "postgresql://postgres:pw@db.aaaaaaaaaaaaaaaaaaaa.supabase.co:5432/postgres",
+  }) as Secrets;
+
+function fakeSs(responder: (sql: string) => Record<string, unknown>[]): {
+  connect: (url: string) => Promise<SqlServerConn>;
+} {
+  return {
+    connect: async () => ({
+      // biome-ignore lint/suspicious/noExplicitAny: shaped test rows
+      async query<T = any>(sql: string): Promise<T[]> {
+        return responder(sql) as T[];
+      },
+      async end() {},
+    }),
+  };
+}
+
+describe("doctor — heterogeneous SQL Server source (live engine-prep checks)", () => {
+  test("a CDC-enabled Enterprise source passes the asserted checks", async () => {
+    const healthy = (sql: string): Record<string, unknown>[] => {
+      if (sql.includes("EngineEdition")) return [{ edition: "3" }];
+      if (sql.includes("is_cdc_enabled")) return [{ is_cdc_enabled: "1" }];
+      return [];
+    };
+    const r = await doctor(sqlServerCfg(), ssSecrets(), {
+      sourceOnly: true,
+      sqlServerConnect: fakeSs(healthy).connect,
+    });
+    expect(r.fail).toBe(0);
+    expect(r.pass).toBeGreaterThanOrEqual(2); // flavour + cdc_enable assert pass
+  });
+
+  test("Express edition + CDC disabled: both fail-severity asserts fail", async () => {
+    const bad = (sql: string): Record<string, unknown>[] => {
+      if (sql.includes("EngineEdition")) return [{ edition: "4" }]; // Express — no CDC
+      if (sql.includes("is_cdc_enabled")) return [{ is_cdc_enabled: "0" }];
+      return [];
+    };
+    const r = await doctor(sqlServerCfg(), ssSecrets(), {
+      sourceOnly: true,
+      sqlServerConnect: fakeSs(bad).connect,
+    });
+    expect(r.fail).toBeGreaterThanOrEqual(2);
+  });
+
+  test("an UNREACHABLE SQL Server source is a single fail, not a crash", async () => {
+    const r = await doctor(sqlServerCfg(), ssSecrets(), {
+      sourceOnly: true,
+      sqlServerConnect: async () => {
+        throw new Error("ETIMEOUT 127.0.0.1:1433");
       },
     });
     expect(r.fail).toBe(1);

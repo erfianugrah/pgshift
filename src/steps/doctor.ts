@@ -1,6 +1,7 @@
 import type { Config, Secrets } from "../config.ts";
 import { classifyConn, connect, type Db, type PgProvider } from "../db.ts";
 import { connectMySql, type MySqlConn } from "../engine/mysql.ts";
+import { connectSqlServer, type SqlServerConn } from "../engine/sqlserver.ts";
 import { check, runCheck, runProbe } from "../kb/checks.ts";
 import { sourcePrepFor } from "../kb/engine-prep.ts";
 import { lookupProviderHint } from "../kb/provider-hints.ts";
@@ -104,6 +105,8 @@ export async function doctor(
     sourceOnly?: boolean;
     /** Injected for tests; defaults to the real mysql2-backed connector (heterogeneous path). */
     mysqlConnect?: (url: string) => Promise<MySqlConn>;
+    /** Injected for tests; defaults to the real mssql-backed connector (heterogeneous path). */
+    sqlServerConnect?: (url: string) => Promise<SqlServerConn>;
   } = {},
 ): Promise<DoctorReport> {
   const r: DoctorReport = { pass: 0, warn: 0, fail: 0 };
@@ -489,14 +492,19 @@ async function targetChecks(
 
 /**
  * doctor for a heterogeneous (Debezium) source. Runs the engine-prep playbook LIVE against the
- * MySQL source (items carrying a machine-checkable `assert`), reports documentation-grade probes
- * as live readings, and does a REDUCED PG target check: Debezium has no PG subscription, so the
- * target just needs to be reachable, version-sane, and already carry the translated tables.
+ * source — MySQL (mysql2) or SQL Server (mssql) — judging items carrying a machine-checkable
+ * `assert`, reporting documentation-grade probes as live readings, and doing a REDUCED PG target
+ * check: Debezium has no PG subscription, so the target just needs to be reachable, version-sane,
+ * and already carry the translated tables.
  */
 async function heterogeneousDoctor(
   cfg: Config,
   secrets: Secrets,
-  opts: { sourceOnly?: boolean; mysqlConnect?: (url: string) => Promise<MySqlConn> },
+  opts: {
+    sourceOnly?: boolean;
+    mysqlConnect?: (url: string) => Promise<MySqlConn>;
+    sqlServerConnect?: (url: string) => Promise<SqlServerConn>;
+  },
   s: Sink,
 ): Promise<void> {
   const tgt = classifyConn(secrets.TARGET_DB_URL);
@@ -506,13 +514,18 @@ async function heterogeneousDoctor(
   );
 
   if (cfg.source.engine === "mysql") {
-    await mysqlSourceChecks(secrets.SOURCE_DB_URL, s, opts.mysqlConnect ?? connectMySql);
+    await liveSourcePrepChecks(
+      "mysql",
+      secrets.SOURCE_DB_URL,
+      s,
+      opts.mysqlConnect ?? connectMySql,
+    );
   } else {
-    // sqlserver: pgshift carries no T-SQL driver, so the prep probes stay documentation-grade.
-    log.step("doctor: source readiness (sqlserver)");
-    s.warn(
-      "live SQL Server source checks are not implemented yet — run `pgshift guide sqlserver` and " +
-        "run the printed detect/verify probes by hand (HETEROGENEOUS.md §6).",
+    await liveSourcePrepChecks(
+      "sqlserver",
+      secrets.SOURCE_DB_URL,
+      s,
+      opts.sqlServerConnect ?? connectSqlServer,
     );
   }
 
@@ -537,26 +550,33 @@ async function heterogeneousDoctor(
 }
 
 /**
- * Run each MySQL source-prep item live: `assert` items are judged pass/warn/fail (by item
- * severity) against the probe rows; `detect`-only items (e.g. binlog retention, whose threshold is
- * judgement-based) are surfaced as live readings to weigh against `verify.expect`; guided/auto
- * items (schema translation, identity resync) are pointed at the command that handles them.
+ * Run each source-prep item live for the given engine: `assert` items are judged pass/warn/fail (by
+ * item severity) against the probe rows; `detect`-only items (e.g. binlog retention, whose threshold
+ * is judgement-based) are surfaced as live readings to weigh against `verify.expect`; guided/auto
+ * items (schema translation, identity resync) are pointed at the command that handles them. MySQL
+ * and SQL Server share this loop — only the connector + the items' SQL differ.
  */
-async function mysqlSourceChecks(
+async function liveSourcePrepChecks(
+  engine: "mysql" | "sqlserver",
   url: string,
   s: Sink,
-  connectMy: (url: string) => Promise<MySqlConn>,
+  open: (url: string) => Promise<{
+    query<T = Record<string, unknown>>(sql: string): Promise<T[]>;
+    end(): Promise<void>;
+  }>,
 ): Promise<void> {
-  log.step("doctor: MySQL source readiness (live engine-prep checks)");
-  let my: MySqlConn;
+  const label = engine === "sqlserver" ? "SQL Server" : "MySQL";
+  log.step(`doctor: ${label} source readiness (live engine-prep checks)`);
+  let conn: { query<T = Record<string, unknown>>(sql: string): Promise<T[]>; end(): Promise<void> };
   try {
-    my = await connectMy(url);
+    conn = await open(url);
   } catch (e) {
-    s.fail(`MySQL source UNREACHABLE — ${e instanceof Error ? e.message : String(e)}`);
+    s.fail(`${label} source UNREACHABLE — ${e instanceof Error ? e.message : String(e)}`);
     return;
   }
+  const my = conn;
   try {
-    for (const item of sourcePrepFor("mysql")) {
+    for (const item of sourcePrepFor(engine)) {
       if (item.assert) {
         let rows: Record<string, unknown>[];
         try {

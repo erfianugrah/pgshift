@@ -23,7 +23,18 @@ import {
   reconcileAggregateReport,
   renderAggregateQuery,
 } from "./reconcile-aggregate.ts";
+import { connectSqlServer, type SqlServerConn } from "./sqlserver.ts";
 import type { CutoverOpts, ReconcileOpts, ReplicationEngine } from "./types.ts";
+
+/**
+ * A heterogeneous source connection. MySqlConn and SqlServerConn are structurally identical
+ * (`query` + `end`), so the engine drives both through this shape; only the rendered SQL + the
+ * write-stop gate differ per flavour.
+ */
+type SourceConn = {
+  query<T = Record<string, unknown>>(sql: string): Promise<T[]>;
+  end(): Promise<void>;
+};
 
 /**
  * The IO seam the DebeziumEngine drives — Docker process control + an HTTP health probe + file
@@ -123,8 +134,11 @@ export function resolveRuntimeOpts(
  * own `mysql2` connection from SOURCE_DB_URL. Orchestration is unit-tested via the injected
  * {@link DebeziumIO} + MySQL seam; the end-to-end path is the Docker harness's job.
  *
- * Heterogeneous source support is mysql-only today; `sqlserver` is the next engine
- * (HETEROGENEOUS.md §6) and the non-mysql lifecycle methods fail loud until it lands.
+ * Heterogeneous source support spans both `mysql` (binlog) and `sqlserver` (CDC change-tables):
+ * the lifecycle methods fork on `cfg.source.engine` for the source client (mysql2 vs mssql), the
+ * rendered SQL (backtick `db`.`table` vs bracket [schema].[table]), the reconcile dialect, and the
+ * write-stop gate (binlog position vs CDC max LSN). The MySQL path is harness-verified
+ * (test/heterogeneous/, PASS); the SQL Server path is exercised by its own harness.
  */
 export class DebeziumEngine implements ReplicationEngine {
   readonly kind = "debezium" as const;
@@ -133,14 +147,13 @@ export class DebeziumEngine implements ReplicationEngine {
     private readonly io: DebeziumIO = defaultDebeziumIO,
     /** Injected for tests; defaults to the real mysql2-backed connector. */
     private readonly mysqlConnect: (url: string) => Promise<MySqlConn> = connectMySql,
+    /** Injected for tests; defaults to the real mssql-backed connector. */
+    private readonly sqlServerConnect: (url: string) => Promise<SqlServerConn> = connectSqlServer,
   ) {}
 
-  private notImplemented(method: string, why: string): never {
-    throw new Error(
-      `DebeziumEngine.${method} is not implemented yet — ${why}. The topology is proven ` +
-        `(spike/debezium-mysql/, PASS) and the delivery vehicle is decided (${debeziumRuntimePin()}). ` +
-        "See docs/HETEROGENEOUS.md §5.",
-    );
+  /** Open the source connection for the configured engine (mysql2 or mssql). */
+  private openSource(engine: "mysql" | "sqlserver", url: string): Promise<SourceConn> {
+    return engine === "sqlserver" ? this.sqlServerConnect(url) : this.mysqlConnect(url);
   }
 
   /** Stage the rendered config, launch the Debezium container, and wait for it to report healthy. */
@@ -199,9 +212,7 @@ export class DebeziumEngine implements ReplicationEngine {
    * watchdog.syncTimeoutMin; polls every watchdog.pollIntervalSec.
    */
   async watch(_source: Db, target: Db, cfg: Config): Promise<void> {
-    if (cfg.source.engine !== "mysql") {
-      this.notImplemented("watch", "only mysql sources are rendered yet (HETEROGENEOUS.md §6)");
-    }
+    const engine = heterogeneousEngine(cfg);
     const url = process.env.SOURCE_DB_URL;
     if (!url) throw new Error("watch (debezium): SOURCE_DB_URL is required");
     const name = debeziumContainerName(cfg.replication.publication);
@@ -211,7 +222,7 @@ export class DebeziumEngine implements ReplicationEngine {
     const deadline = Date.now() + cfg.watchdog.syncTimeoutMin * 60_000;
     log.step("watch (debezium) — connector health + initial-sync catch-up");
 
-    const my = await this.mysqlConnect(url);
+    const my = await this.openSource(engine, url);
     let unreachable = 0;
     try {
       for (;;) {
@@ -237,9 +248,9 @@ export class DebeziumEngine implements ReplicationEngine {
         let caughtUp = true;
         const progress: string[] = [];
         for (const t of cfg.reconcile.tables) {
-          const [db, tbl] = t.name.split(".") as [string, string];
+          const [, tbl] = t.name.split(".") as [string, string];
           const [s] = await my.query<{ n: string }>(
-            `SELECT count(*) AS n FROM \`${db}\`.\`${tbl}\``,
+            `SELECT count(*) AS n FROM ${sourceRelation(engine, t.name)}`,
           );
           const [tg] = (await target.unsafe(
             `SELECT count(*)::bigint AS n FROM "public"."${tbl}"`,
@@ -275,25 +286,25 @@ export class DebeziumEngine implements ReplicationEngine {
     cfg: Config,
     opts: ReconcileOpts = {},
   ): Promise<boolean> {
-    if (cfg.source.engine !== "mysql") {
-      this.notImplemented("reconcile", "only mysql sources are rendered yet (HETEROGENEOUS.md §6)");
-    }
+    const engine = heterogeneousEngine(cfg);
     const url = process.env.SOURCE_DB_URL;
     if (!url)
-      throw new Error("reconcile (debezium): SOURCE_DB_URL is required to scan the MySQL source");
+      throw new Error(
+        `reconcile (debezium): SOURCE_DB_URL is required to scan the ${engine} source`,
+      );
 
     log.step("reconcile (debezium — count + portable aggregates, NOT a byte-exact row hash)");
-    const my = await this.mysqlConnect(url);
+    const my = await this.openSource(engine, url);
     const reports = [];
     try {
       for (const t of cfg.reconcile.tables) {
-        const [db, tbl] = t.name.split(".") as [string, string];
+        const [srcSchema, tbl] = t.name.split(".") as [string, string];
         const cols = await targetAggColumns(target, "public", tbl);
         if (cols.length === 0) {
           log.err(`${t.name}: no non-generated columns on target public.${tbl}`);
           return false;
         }
-        const myRows = await my.query(renderAggregateQuery("mysql", db, tbl, cols));
+        const myRows = await my.query(renderAggregateQuery(engine, srcSchema, tbl, cols));
         const pgRows = (await target.unsafe(
           renderAggregateQuery("postgres", "public", tbl, cols),
         )) as Record<string, unknown>[];
@@ -345,40 +356,39 @@ export class DebeziumEngine implements ReplicationEngine {
    * `pgshift translate --sign-off`.
    */
   async cutover(_source: Db, target: Db, cfg: Config, opts: CutoverOpts): Promise<void> {
-    if (cfg.source.engine !== "mysql") {
-      this.notImplemented("cutover", "only mysql sources are rendered yet (HETEROGENEOUS.md §6)");
-    }
+    const engine = heterogeneousEngine(cfg);
     // Schema sign-off gate (the `guided` heart) — must pass before we touch the source/target.
     assertSchemaSignedOff(opts.outDir ?? "ledger");
     const url = process.env.SOURCE_DB_URL;
     if (!url) throw new Error("cutover (debezium): SOURCE_DB_URL is required");
-    log.step("cutover (debezium) — MySQL write-stop gate + identity resync");
+    const posLabel = engine === "sqlserver" ? "CDC max LSN" : "binlog position";
+    log.step(`cutover (debezium) — ${engine} write-stop gate + identity resync`);
     log.warn(
-      "Assuming application writes to the SOURCE MySQL are already stopped. If not, stop them now.",
+      `Assuming application writes to the SOURCE ${engine} are already stopped. If not, stop them now.`,
     );
 
-    const my = await this.mysqlConnect(url);
+    const my = await this.openSource(engine, url);
     try {
-      // 0. write-stop gate: the binlog position must be stable across a short window.
-      const pos1 = await binlogPosition(my);
+      // 0. write-stop gate: the source commit position must be stable across a short window.
+      const pos1 = await sourceCommitPosition(engine, my);
       await this.io.sleep(2000);
-      const pos2 = await binlogPosition(my);
+      const pos2 = await sourceCommitPosition(engine, my);
       if (pos1 !== pos2) {
         throw new Error(
-          `source binlog still advancing (${pos1} -> ${pos2}) — writes to the MySQL source are NOT ` +
-            "stopped. Stop them before cutover; any write after this point would be LOST.",
+          `source ${posLabel} still advancing (${pos1} -> ${pos2}) — writes to the ${engine} source ` +
+            "are NOT stopped. Stop them before cutover; any write after this point would be LOST.",
         );
       }
-      log.ok(`source binlog stable at ${pos1} — writes appear stopped`);
+      log.ok(`source ${posLabel} stable at ${pos1} — writes appear stopped`);
 
       // 1. drain: poll until row counts converge (no precise offset needed once writes are stopped).
       const deadline = Date.now() + (opts.maxLagWaitSec ?? 300) * 1000;
       for (;;) {
         let converged = true;
         for (const t of cfg.reconcile.tables) {
-          const [db, tbl] = t.name.split(".") as [string, string];
+          const [, tbl] = t.name.split(".") as [string, string];
           const [s] = await my.query<{ n: string }>(
-            `SELECT count(*) AS n FROM \`${db}\`.\`${tbl}\``,
+            `SELECT count(*) AS n FROM ${sourceRelation(engine, t.name)}`,
           );
           const [tg] = (await target.unsafe(
             `SELECT count(*)::bigint AS n FROM "public"."${tbl}"`,
@@ -402,7 +412,7 @@ export class DebeziumEngine implements ReplicationEngine {
       }
 
       // 2. identity/sequence resync (no-op for explicit-PK schemas with no owned sequences).
-      await resyncTargetSequences(my, target, cfg);
+      await resyncTargetSequences(engine, my, target, cfg);
     } finally {
       await my.end();
     }
@@ -447,8 +457,48 @@ async function targetAggColumns(target: Db, schema: string, table: string): Prom
   }));
 }
 
+/** Narrow a config's source to the heterogeneous engines (the only ones the DebeziumEngine drives). */
+function heterogeneousEngine(cfg: Config): "mysql" | "sqlserver" {
+  if (cfg.source.engine === "postgres") {
+    throw new Error(
+      "DebeziumEngine received a postgres source — engineFor routes postgres to NativePgEngine. " +
+        "This is an internal dispatch bug.",
+    );
+  }
+  return cfg.source.engine;
+}
+
+/** The fully-quoted source relation for a `schema.table` (mysql `db.table`) name, per engine. */
+function sourceRelation(engine: "mysql" | "sqlserver", qualifiedName: string): string {
+  const [a, b] = qualifiedName.split(".") as [string, string];
+  return engine === "sqlserver" ? `[${a}].[${b}]` : `\`${a}\`.\`${b}\``;
+}
+
+/** Quote a single source column identifier per engine. */
+function sourceCol(engine: "mysql" | "sqlserver", col: string): string {
+  return engine === "sqlserver" ? `[${col}]` : `\`${col}\``;
+}
+
+/** Read the source commit position (the write-stop gate's stability probe), per engine. */
+function sourceCommitPosition(engine: "mysql" | "sqlserver", conn: SourceConn): Promise<string> {
+  return engine === "sqlserver" ? sqlServerMaxLsn(conn) : binlogPosition(conn);
+}
+
+/**
+ * Read the SQL Server CDC max LSN as a hex string. A stable value across a window means no new
+ * committed change has been captured (the CDC analogue of a stable binlog position). NULL (no CDC
+ * activity / capture not yet run) is itself stable, which is the correct read once writes stop.
+ */
+async function sqlServerMaxLsn(conn: SourceConn): Promise<string> {
+  const [r] = await conn.query<{ lsn: unknown }>("SELECT sys.fn_cdc_get_max_lsn() AS lsn");
+  const v = r?.lsn;
+  if (v === null || v === undefined) return "NULL";
+  if (v instanceof Uint8Array) return Buffer.from(v).toString("hex");
+  return String(v);
+}
+
 /** Read the MySQL binlog position as `file:pos`. Handles the 8.4 rename of SHOW MASTER STATUS. */
-async function binlogPosition(my: MySqlConn): Promise<string> {
+async function binlogPosition(my: SourceConn): Promise<string> {
   for (const stmt of ["SHOW BINARY LOG STATUS", "SHOW MASTER STATUS"]) {
     try {
       const [r] = await my.query<{ File?: string; Position?: string | number }>(stmt);
@@ -468,9 +518,14 @@ async function binlogPosition(my: MySqlConn): Promise<string> {
  * explicit PK values, so any target sequence is stuck at its schema-load value and the next LOCAL
  * insert would collide. No-op when the schema has no owned sequences (explicit-PK / uuid tables).
  */
-async function resyncTargetSequences(my: MySqlConn, target: Db, cfg: Config): Promise<void> {
+async function resyncTargetSequences(
+  engine: "mysql" | "sqlserver",
+  my: SourceConn,
+  target: Db,
+  cfg: Config,
+): Promise<void> {
   for (const t of cfg.reconcile.tables) {
-    const [db, tbl] = t.name.split(".") as [string, string];
+    const [, tbl] = t.name.split(".") as [string, string];
     const seqs = await target`
       SELECT quote_ident(sn.nspname) || '.' || quote_ident(s.relname) AS seq, a.attname AS col
       FROM pg_class s
@@ -490,7 +545,7 @@ async function resyncTargetSequences(my: MySqlConn, target: Db, cfg: Config): Pr
       const col = String(row.col);
       try {
         const [mx] = await my.query<{ m: string | null }>(
-          `SELECT max(\`${col}\`) AS m FROM \`${db}\`.\`${tbl}\``,
+          `SELECT max(${sourceCol(engine, col)}) AS m FROM ${sourceRelation(engine, t.name)}`,
         );
         const maxVal = mx?.m ?? null;
         if (maxVal === null) {

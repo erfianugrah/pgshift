@@ -236,6 +236,18 @@ const SQLSERVER: SourcePrepItem[] = [
       sql: "SELECT SERVERPROPERTY('EngineEdition')",
       expect: "5 (Azure SQL DB) | 8 (Managed Instance) | 3 (VM/on-prem)",
     },
+    assert: {
+      sql: "SELECT CAST(SERVERPROPERTY('EngineEdition') AS varchar(8)) AS edition",
+      rules: [
+        {
+          kind: "oneOf",
+          column: "edition",
+          values: ["2", "3", "5", "8"],
+          label:
+            "EngineEdition is CDC-capable (2 Standard | 3 Enterprise/Dev | 5 Azure SQL DB | 8 Managed Instance; NOT 1 Personal / 4 Express)",
+        },
+      ],
+    },
     provenance: {
       source:
         "https://learn.microsoft.com/en-us/azure/azure-sql/database/change-data-capture-overview",
@@ -259,6 +271,12 @@ const SQLSERVER: SourcePrepItem[] = [
       "them exclusively).",
     detect: { sql: "SELECT is_cdc_enabled FROM sys.databases WHERE name = DB_NAME()" },
     verify: { sql: "SELECT is_cdc_enabled FROM sys.databases WHERE name = DB_NAME()", expect: "1" },
+    assert: {
+      sql: "SELECT CAST(is_cdc_enabled AS varchar(1)) AS is_cdc_enabled FROM sys.databases WHERE name = DB_NAME()",
+      rules: [
+        { kind: "eq", column: "is_cdc_enabled", value: "1", label: "CDC enabled on the database" },
+      ],
+    },
     provenance: {
       source:
         "https://learn.microsoft.com/en-us/azure/azure-sql/database/change-data-capture-overview",

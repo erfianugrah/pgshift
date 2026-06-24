@@ -14,8 +14,8 @@
  *               unreviewed translated schema.
  *
  * Heterogeneous-only: a `postgres` source needs no translation (the schema is dumped verbatim by
- * `bootstrap`), and `sqlserver` translation is not built yet (the T-SQL matrix is the harder second
- * engine — HETEROGENEOUS.md §6). Both fail loud here rather than silently no-op.
+ * `bootstrap`). Both `mysql` (information_schema) and `sqlserver` (T-SQL catalog) are supported,
+ * forking on `cfg.source.engine`; a postgres source fails loud here rather than silently no-op.
  */
 
 import { existsSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
@@ -24,6 +24,8 @@ import type { Config, Secrets } from "../config.ts";
 import type { Db } from "../db.ts";
 import { connectMySql, type MySqlConn } from "../engine/mysql.ts";
 import { draftTargetSchema, type SchemaDraft } from "../engine/schema-translate.ts";
+import { connectSqlServer, type SqlServerConn } from "../engine/sqlserver.ts";
+import { draftTargetSchemaSqlServer } from "../engine/sqlserver-schema-translate.ts";
 import { log } from "../log.ts";
 
 const SQL_FILE = "target-schema.sql";
@@ -93,6 +95,8 @@ export interface TranslateOpts {
   target?: Db;
   /** Injected for tests; defaults to the real mysql2-backed connector. */
   mysqlConnect?: (url: string) => Promise<MySqlConn>;
+  /** Injected for tests; defaults to the real mssql-backed connector. */
+  sqlServerConnect?: (url: string) => Promise<SqlServerConn>;
 }
 
 export interface TranslateResult {
@@ -118,13 +122,6 @@ export async function translate(
         "(mysql) sources only.",
     );
   }
-  if (cfg.source.engine === "sqlserver") {
-    throw new Error(
-      "translate: SQL Server schema translation is not implemented yet (the T-SQL→PL/pgSQL matrix " +
-        "is the harder second engine — HETEROGENEOUS.md §6). `pgshift guide sqlserver` shows the " +
-        "manual mapping playbook in the meantime.",
-    );
-  }
   if (opts.apply && !opts.target) {
     throw new Error(
       "translate: --apply requires a target connection (internal: opts.target unset)",
@@ -133,29 +130,39 @@ export async function translate(
 
   const url = secrets.SOURCE_DB_URL;
   const byDb = groupTablesByDatabase(cfg.replication.tables);
-  log.step(`translate (mysql→postgres) — drafting ${cfg.replication.tables.length} table(s)`);
+  const engine = cfg.source.engine;
+  log.step(`translate (${engine}→postgres) — drafting ${cfg.replication.tables.length} table(s)`);
 
-  const connect = opts.mysqlConnect ?? connectMySql;
-  const my = await connect(url);
+  // Both source clients share the query/end shape; the drafter (information_schema vs T-SQL
+  // catalog) is what forks. For MySQL the byDb key is the database; for SQL Server it is the schema
+  // (e.g. `dbo`) — groupTablesByDatabase splits on `.` either way.
+  const conn =
+    engine === "sqlserver"
+      ? await (opts.sqlServerConnect ?? connectSqlServer)(url)
+      : await (opts.mysqlConnect ?? connectMySql)(url);
   let draft: SchemaDraft;
   try {
     const parts: SchemaDraft[] = [];
-    for (const [db, tables] of byDb) {
-      parts.push(await draftTargetSchema(my, db, tables));
+    for (const [scope, tables] of byDb) {
+      parts.push(
+        engine === "sqlserver"
+          ? await draftTargetSchemaSqlServer(conn as SqlServerConn, scope, tables)
+          : await draftTargetSchema(conn as MySqlConn, scope, tables),
+      );
     }
     draft = {
       sql: parts.map((p) => p.sql).join("\n\n"),
       decisions: parts.flatMap((p) => p.decisions),
     };
   } finally {
-    await my.end();
+    await conn.end();
   }
 
   const manifest = buildManifest(cfg, draft);
   const paths = schemaArtifactPaths(opts.outDir);
   mkdirSync(opts.outDir, { recursive: true });
   const header =
-    `-- pgshift target schema — DRAFTED ${manifest.generatedAt} from MySQL ${manifest.source.databases.join(", ")}\n` +
+    `-- pgshift target schema — DRAFTED ${manifest.generatedAt} from ${engine} ${manifest.source.databases.join(", ")}\n` +
     "-- REVIEW the type decisions below, apply to the target, then `pgshift translate --sign-off`.\n" +
     "-- pgshift NEVER auto-applies this (GUIDED-MIGRATION.md §7); cutover is gated on sign-off.\n\n";
   writeFileSync(paths.sql, `${header}${draft.sql}\n`, { mode: 0o644 });

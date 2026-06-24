@@ -37,6 +37,16 @@ const MYSQL: SourcePrepItem[] = [
       sql: "SHOW GRANTS FOR CURRENT_USER",
       expect: "includes REPLICATION SLAVE + REPLICATION CLIENT",
     },
+    assert: {
+      sql: "SHOW GRANTS FOR CURRENT_USER",
+      rules: [
+        {
+          kind: "contains",
+          all: ["REPLICATION SLAVE", "REPLICATION CLIENT"],
+          label: "REPLICATION SLAVE + REPLICATION CLIENT granted",
+        },
+      ],
+    },
     provenance: {
       source: "https://debezium.io/documentation/reference/stable/connectors/mysql.html",
       lastSynced: "2026-06-24",
@@ -60,6 +70,14 @@ const MYSQL: SourcePrepItem[] = [
       sql: "SELECT @@log_bin, @@binlog_format, @@binlog_row_image",
       expect: "1, ROW, FULL",
     },
+    assert: {
+      sql: "SELECT @@log_bin AS log_bin, @@binlog_format AS binlog_format, @@binlog_row_image AS binlog_row_image",
+      rules: [
+        { kind: "eq", column: "log_bin", value: "1", label: "log_bin enabled" },
+        { kind: "eq", column: "binlog_format", value: "ROW", label: "binlog_format=ROW" },
+        { kind: "eq", column: "binlog_row_image", value: "FULL", label: "binlog_row_image=FULL" },
+      ],
+    },
     provenance: {
       source: "https://debezium.io/documentation/reference/stable/connectors/mysql.html",
       lastSynced: "2026-06-24",
@@ -79,6 +97,18 @@ const MYSQL: SourcePrepItem[] = [
       "  SET @@GLOBAL.gtid_mode = ON;   -- on a live server, ramp OFF→OFF_PERMISSIVE→ON_PERMISSIVE→ON",
     detect: { sql: "SELECT @@gtid_mode, @@enforce_gtid_consistency" },
     verify: { sql: "SELECT @@gtid_mode, @@enforce_gtid_consistency", expect: "ON, ON" },
+    assert: {
+      sql: "SELECT @@gtid_mode AS gtid_mode, @@enforce_gtid_consistency AS enforce_gtid_consistency",
+      rules: [
+        { kind: "eq", column: "gtid_mode", value: "ON", label: "gtid_mode=ON" },
+        {
+          kind: "eq",
+          column: "enforce_gtid_consistency",
+          value: "ON",
+          label: "enforce_gtid_consistency=ON",
+        },
+      ],
+    },
     provenance: {
       source: "https://debezium.io/documentation/reference/stable/connectors/mysql.html",
       lastSynced: "2026-06-24",
@@ -118,6 +148,16 @@ const MYSQL: SourcePrepItem[] = [
       "cannot see full JSON column changes.",
     detect: { sql: "SELECT @@binlog_row_value_options" },
     verify: { sql: "SELECT @@binlog_row_value_options", expect: "'' (empty)" },
+    assert: {
+      sql: "SELECT @@binlog_row_value_options AS binlog_row_value_options",
+      rules: [
+        {
+          kind: "empty",
+          column: "binlog_row_value_options",
+          label: "binlog_row_value_options empty (not PARTIAL_JSON)",
+        },
+      ],
+    },
     provenance: {
       source: "https://debezium.io/documentation/reference/stable/connectors/mysql.html",
       lastSynced: "2026-06-24",

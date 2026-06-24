@@ -121,6 +121,45 @@ export type SourcePrepEngine = z.infer<typeof SourcePrepEngine>;
  * + verifies, `assisted`/`guided` draft-then-ratify, `informed` prints + acks. Today only the
  * print path exists.
  */
+/**
+ * A single machine-checkable rule over the row(s) returned by a source-prep `assert.sql`. Kept as
+ * serialisable data (not a closure) so it stays drift-checkable, unit-testable, and renderable.
+ *   - `eq`        observed `rows[0][column]` must stringify-equal `value` (e.g. binlog_format=ROW)
+ *   - `oneOf`     observed `rows[0][column]` must be one of `values`
+ *   - `empty`     observed `rows[0][column]` must be empty/NULL (e.g. binlog_row_value_options)
+ *   - `contains`  the WHOLE result set (all rows/cols, stringified) must contain every `all`
+ *                 substring, case-insensitively (e.g. SHOW GRANTS must include both REPLICATION
+ *                 privileges — the column name is dynamic, so we scan the lot)
+ */
+export const SourcePrepRule = z.discriminatedUnion("kind", [
+  z.object({
+    kind: z.literal("eq"),
+    column: z.string().min(1),
+    value: z.string(),
+    label: z.string().min(1),
+  }),
+  z.object({
+    kind: z.literal("oneOf"),
+    column: z.string().min(1),
+    values: z.array(z.string()).min(1),
+    label: z.string().min(1),
+  }),
+  z.object({ kind: z.literal("empty"), column: z.string().min(1), label: z.string().min(1) }),
+  z.object({
+    kind: z.literal("contains"),
+    all: z.array(z.string()).min(1),
+    label: z.string().min(1),
+  }),
+]);
+export type SourcePrepRule = z.infer<typeof SourcePrepRule>;
+
+/** A live probe + the rules its result must satisfy. doctor runs this against a MySQL source. */
+export const SourcePrepAssert = z.object({
+  sql: z.string().min(1),
+  rules: z.array(SourcePrepRule).min(1),
+});
+export type SourcePrepAssert = z.infer<typeof SourcePrepAssert>;
+
 export const SourcePrepItem = z.object({
   /** Stable id, engine-prefixed, e.g. "mysql.binlog_enabled". */
   id: z.string().min(1),
@@ -139,6 +178,10 @@ export const SourcePrepItem = z.object({
   detect: z.object({ sql: z.string().min(1) }).optional(),
   /** Source-side verify probe + the human-readable expected result. Documentation-grade today. */
   verify: z.object({ sql: z.string().min(1), expect: z.string().min(1) }).optional(),
+  /** Machine-checkable assertion `doctor` runs LIVE against the source (heterogeneous doctor
+   *  path). When present, doctor executes `assert.sql` and evaluates every rule; items without
+   *  it stay documentation-grade — doctor reports their `detect` reading or a manual pointer. */
+  assert: SourcePrepAssert.optional(),
   provenance: Provenance,
 });
 export type SourcePrepItem = z.infer<typeof SourcePrepItem>;

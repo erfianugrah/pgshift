@@ -156,10 +156,21 @@ The full `DebeziumEngine` lifecycle is built and proven end-to-end against real 
 - **`watch`** — connector liveness via `/q/health` (the `debezium` check) + source/target row-count
   convergence. NB: this image ships **no** `/q/metrics` endpoint (404), so there is no HTTP lag
   number — health + count-convergence are the observable initial-sync-complete signals.
-- **`cutover`** — MySQL write-stop gate (`SHOW MASTER STATUS` position stability) → row-count drain
-  → identity/sequence resync (no-op for explicit-PK schemas) → stop the container (the
-  drop-subscription analogue).
+- **`cutover`** — translated-schema **sign-off gate** (`assertSchemaSignedOff`) → MySQL write-stop
+  gate (`SHOW MASTER STATUS` position stability) → row-count drain → identity/sequence resync
+  (no-op for explicit-PK schemas) → stop the container (the drop-subscription analogue).
 - **`teardown`** — stop + `rm -f` the container + drop the offset volume, idempotent.
+
+Two CLI surfaces complete the guided path (MVP §5 item 3, DELIVERED 2026-06-24):
+
+- **`pgshift translate`** — drafts target Postgres DDL from the MySQL `information_schema`, writes
+  `<out-dir>/target-schema.sql` + `target-schema.decisions.json` (never auto-applies), `--apply`
+  to load it, `--sign-off` to ratify. `cutover` refuses to run until the draft is signed off.
+- **`pgshift doctor`** — for a heterogeneous source, runs the MySQL engine-prep playbook **live**:
+  the items carrying a machine-checkable `assert` (grants, binlog ROW+FULL, GTID,
+  `binlog_row_value_options`) are judged pass/warn/fail against the real server; retention is a
+  live reading to weigh by hand; the schema gate points at `translate`. Target checks drop to
+  reachability + version + translated-tables-exist (no CREATE SUBSCRIPTION — Debezium is the sink).
 
 Orchestration logic is unit-tested behind an injected IO + MySQL seam (`test/debezium-runtime-io.test.ts`);
 the real Docker + Debezium behaviour is the harness's job. `mysql2` is the source-side client (the

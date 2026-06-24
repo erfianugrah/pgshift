@@ -1,7 +1,10 @@
 import type { Config, Secrets } from "../config.ts";
 import { classifyConn, connect, type Db, type PgProvider } from "../db.ts";
+import { connectMySql, type MySqlConn } from "../engine/mysql.ts";
 import { check, runCheck, runProbe } from "../kb/checks.ts";
+import { sourcePrepFor } from "../kb/engine-prep.ts";
 import { lookupProviderHint } from "../kb/provider-hints.ts";
+import { evalRules } from "../kb/source-prep-eval.ts";
 import { log } from "../log.ts";
 import { extensionStatements, missingExtensions } from "./bootstrap.ts";
 import {
@@ -97,7 +100,11 @@ export interface DoctorReport {
 export async function doctor(
   cfg: Config,
   secrets: Secrets,
-  opts: { sourceOnly?: boolean } = {},
+  opts: {
+    sourceOnly?: boolean;
+    /** Injected for tests; defaults to the real mysql2-backed connector (heterogeneous path). */
+    mysqlConnect?: (url: string) => Promise<MySqlConn>;
+  } = {},
 ): Promise<DoctorReport> {
   const r: DoctorReport = { pass: 0, warn: 0, fail: 0 };
   const ok = (m: string) => {
@@ -123,6 +130,14 @@ export async function doctor(
   secrets.SUPABASE_ACCESS_TOKEN
     ? ok("SUPABASE_ACCESS_TOKEN present (config-sync available)")
     : warn("SUPABASE_ACCESS_TOKEN unset — config-sync will be unavailable");
+
+  // Heterogeneous source (mysql/sqlserver): a mysql://-style DSN driven by Debezium CDC. The PG
+  // pooler/direct ladder, pg_* source checks, and CREATE-SUBSCRIPTION target checks don't apply.
+  // Walk the engine-prep playbook live against the source instead + a reduced PG target check.
+  if (cfg.source.engine !== "postgres") {
+    await heterogeneousDoctor(cfg, secrets, opts, { ok, warn, fail });
+    return summarize(r);
+  }
 
   const src = classifyConn(secrets.SOURCE_DB_URL);
   const tgt = classifyConn(secrets.TARGET_DB_URL);
@@ -194,7 +209,11 @@ export async function doctor(
     await close();
   }
 
-  // ── summary ──────────────────────────────────────────────────────────
+  return summarize(r);
+}
+
+/** Shared verdict footer for both the native-PG and heterogeneous doctor paths. */
+function summarize(r: DoctorReport): DoctorReport {
   log.step("doctor: summary");
   const verdict = r.fail > 0 ? "NOT READY" : r.warn > 0 ? "READY (with warnings)" : "READY";
   log.detail(`${r.pass} pass · ${r.warn} warn · ${r.fail} fail`);
@@ -464,6 +483,147 @@ async function targetChecks(
           `subscription ${cfg.replication.subscription} is NOT replicating: ${notSubbed.join(", ")} ` +
             "— added to the publication after the subscription was created. Re-run `replicate` " +
             "(it now issues REFRESH PUBLICATION) to start their initial copy.",
+        );
+  }
+}
+
+/**
+ * doctor for a heterogeneous (Debezium) source. Runs the engine-prep playbook LIVE against the
+ * MySQL source (items carrying a machine-checkable `assert`), reports documentation-grade probes
+ * as live readings, and does a REDUCED PG target check: Debezium has no PG subscription, so the
+ * target just needs to be reachable, version-sane, and already carry the translated tables.
+ */
+async function heterogeneousDoctor(
+  cfg: Config,
+  secrets: Secrets,
+  opts: { sourceOnly?: boolean; mysqlConnect?: (url: string) => Promise<MySqlConn> },
+  s: Sink,
+): Promise<void> {
+  const tgt = classifyConn(secrets.TARGET_DB_URL);
+  log.detail(
+    `source engine ${cfg.source.engine} (Debezium CDC; SOURCE_DB_URL is a ${cfg.source.engine}:// DSN)   ` +
+      `target conn ${tgt.host}:${tgt.port} (${tgt.provider})`,
+  );
+
+  if (cfg.source.engine === "mysql") {
+    await mysqlSourceChecks(secrets.SOURCE_DB_URL, s, opts.mysqlConnect ?? connectMySql);
+  } else {
+    // sqlserver: pgshift carries no T-SQL driver, so the prep probes stay documentation-grade.
+    log.step("doctor: source readiness (sqlserver)");
+    s.warn(
+      "live SQL Server source checks are not implemented yet — run `pgshift guide sqlserver` and " +
+        "run the printed detect/verify probes by hand (HETEROGENEOUS.md §6).",
+    );
+  }
+
+  if (opts.sourceOnly) return;
+
+  // Reduced target check. connect() also builds a PG client from the mysql:// SOURCE_DB_URL, but
+  // it's lazy (no connection until queried) and we never query it here — only `target`.
+  const { target, close } = connect(secrets, { connectTimeoutSec: 10 });
+  try {
+    const reach = await probe(target);
+    if (!reach.ok) {
+      s.warn(
+        `target not reachable yet (${tgt.host}) — expected during prep before it's created: ${reachHint(reach.error, tgt)}`,
+      );
+      return;
+    }
+    s.ok(`target reachable (${tgt.host})`);
+    await heterogeneousTargetChecks(target, cfg, s);
+  } finally {
+    await close();
+  }
+}
+
+/**
+ * Run each MySQL source-prep item live: `assert` items are judged pass/warn/fail (by item
+ * severity) against the probe rows; `detect`-only items (e.g. binlog retention, whose threshold is
+ * judgement-based) are surfaced as live readings to weigh against `verify.expect`; guided/auto
+ * items (schema translation, identity resync) are pointed at the command that handles them.
+ */
+async function mysqlSourceChecks(
+  url: string,
+  s: Sink,
+  connectMy: (url: string) => Promise<MySqlConn>,
+): Promise<void> {
+  log.step("doctor: MySQL source readiness (live engine-prep checks)");
+  let my: MySqlConn;
+  try {
+    my = await connectMy(url);
+  } catch (e) {
+    s.fail(`MySQL source UNREACHABLE — ${e instanceof Error ? e.message : String(e)}`);
+    return;
+  }
+  try {
+    for (const item of sourcePrepFor("mysql")) {
+      if (item.assert) {
+        let rows: Record<string, unknown>[];
+        try {
+          rows = await my.query(item.assert.sql);
+        } catch (e) {
+          s.fail(`${item.title}: probe failed — ${e instanceof Error ? e.message : String(e)}`);
+          continue;
+        }
+        const results = evalRules(item.assert.rules, rows);
+        const failed = results.filter((x) => !x.ok);
+        if (failed.length === 0) {
+          s.ok(`${item.title} (${results.map((x) => x.label).join(", ")})`);
+        } else {
+          const detail = failed.map((x) => `${x.label} [${x.observed}]`).join("; ");
+          item.severity === "fail"
+            ? s.fail(`${item.title}: ${detail}`)
+            : s.warn(`${item.title}: ${detail}`);
+          log.detail(`fix: ${item.guidance.split("\n")[0]}`);
+        }
+      } else if (item.detect) {
+        try {
+          const rows = await my.query(item.detect.sql);
+          const reading = rows.length ? JSON.stringify(rows[0]) : "(no rows)";
+          s.warn(
+            `${item.title}: verify manually — observed ${reading}; expect ${item.verify?.expect ?? "see guide"}`,
+          );
+        } catch (e) {
+          s.warn(`${item.title}: probe failed — ${e instanceof Error ? e.message : String(e)}`);
+        }
+      } else {
+        log.detail(
+          `${item.title}: ${
+            item.klass === "guided"
+              ? "run `pgshift translate` (cutover is gated on sign-off)"
+              : "handled automatically at the relevant phase"
+          }`,
+        );
+      }
+    }
+  } finally {
+    await my.end();
+  }
+}
+
+/**
+ * Reduced PG target check for a Debezium migration: version sanity + the translated tables exist.
+ * Debezium's RegexRouter lands rows under `public.<bare table>`, so we check `public.<table>` for
+ * each configured `schema.table`. No subscription/grant/extension/FK checks — PG-source only.
+ */
+async function heterogeneousTargetChecks(target: Db, cfg: Config, s: Sink): Promise<void> {
+  log.step("doctor: target readiness (Debezium JDBC sink)");
+  const [v] = await target`SHOW server_version_num`;
+  const num = Number(v?.server_version_num ?? 0);
+  num >= 150_000
+    ? s.ok(`target PG ${num} (≥15)`)
+    : s.warn(`target PG ${num} — pgshift targets PG15+`);
+
+  const tq = (sql: string, p?: readonly unknown[]) => target.unsafe(sql, (p ?? []) as never[]);
+  const schemaLoaded = check("target.schema_loaded");
+  for (const qt of cfg.replication.tables) {
+    const [, table] = qt.split(".");
+    const row = await runProbe<{ relkind: string }>(tq, schemaLoaded, ["public", table ?? ""]);
+    row
+      ? s.ok(`target table public.${table} exists (translated schema loaded)`)
+      : s.fail(
+          `target table public.${table} MISSING — run \`pgshift translate --apply\` to load the ` +
+            "translated schema (Debezium does not create tables)",
         );
   }
 }

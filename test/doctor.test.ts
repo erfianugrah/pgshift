@@ -1,6 +1,12 @@
 import { describe, expect, test } from "bun:test";
 import { classifyConn } from "../src/db.ts";
-import { diffHashColumns, externalDeps, type Fk, providerHint } from "../src/steps/doctor.ts";
+import {
+  diffHashColumns,
+  externalDeps,
+  type Fk,
+  providerHint,
+  providerNotes,
+} from "../src/steps/doctor.ts";
 
 describe("classifyConn", () => {
   test("direct Supabase host → ref extracted, not pooler", () => {
@@ -171,6 +177,38 @@ describe("providerHint", () => {
     expect(providerHint("rds-postgres", "target")).toBeNull();
     expect(providerHint("aurora-postgres", "target")).toBeNull();
     expect(providerHint("azure-postgres", "target")).toBeNull();
+  });
+});
+
+describe("providerNotes", () => {
+  test("both sides have hints → source + target notes, prefixed", () => {
+    const notes = providerNotes({ provider: "rds-postgres" }, { provider: "neon" });
+    expect(notes).toHaveLength(2);
+    expect(notes[0]).toStartWith("source provider note — ");
+    expect(notes[0]).toContain("rds.logical_replication=1");
+    expect(notes[1]).toStartWith("target provider note — ");
+    expect(notes[1]).toMatch(/scale to zero/i);
+  });
+
+  test("sourceOnly → target note suppressed even when target has a hint", () => {
+    const notes = providerNotes(
+      { provider: "rds-postgres" },
+      { provider: "neon" },
+      { sourceOnly: true },
+    );
+    expect(notes).toHaveLength(1);
+    expect(notes[0]).toStartWith("source provider note — ");
+  });
+
+  test("null source hint omitted; null target hint omitted", () => {
+    // supabase source has no hint, rds target has no target-role hint
+    expect(providerNotes({ provider: "supabase" }, { provider: "rds-postgres" })).toEqual([]);
+  });
+
+  test("null source hint but live target hint → only target note", () => {
+    const notes = providerNotes({ provider: "generic" }, { provider: "neon" });
+    expect(notes).toHaveLength(1);
+    expect(notes[0]).toStartWith("target provider note — ");
   });
 });
 

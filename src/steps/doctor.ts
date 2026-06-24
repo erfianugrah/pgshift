@@ -124,12 +124,7 @@ export async function doctor(
     `source conn ${src.host}:${src.port} (${src.provider})   ` +
       `target conn ${tgt.host}:${tgt.port} (${tgt.provider})`,
   );
-  const srcHint = providerHint(src.provider, "source");
-  if (srcHint) log.detail(`source provider note — ${srcHint}`);
-  if (!opts.sourceOnly) {
-    const tgtHint = providerHint(tgt.provider, "target");
-    if (tgtHint) log.detail(`target provider note — ${tgtHint}`);
-  }
+  for (const note of providerNotes(src, tgt, { sourceOnly: opts.sourceOnly })) log.detail(note);
   const repl = secrets.SOURCE_REPLICATION_URL ? classifyConn(secrets.SOURCE_REPLICATION_URL) : null;
   if (src.isPooler) {
     if (repl?.isSupabaseDirect)
@@ -210,6 +205,26 @@ async function probe(db: Db): Promise<{ ok: boolean; error?: string }> {
   } catch (e) {
     return { ok: false, error: e instanceof Error ? e.message : String(e) };
   }
+}
+
+/**
+ * The provider advisory lines doctor emits via `log.detail`, as plain strings. Pure so the
+ * wiring conditionals (source always; target only when not source-only; nothing when the
+ * hint is null) are unit-testable without a live connection.
+ */
+export function providerNotes(
+  src: { provider: PgProvider },
+  tgt: { provider: PgProvider },
+  opts: { sourceOnly?: boolean } = {},
+): string[] {
+  const notes: string[] = [];
+  const s = providerHint(src.provider, "source");
+  if (s) notes.push(`source provider note — ${s}`);
+  if (!opts.sourceOnly) {
+    const t = providerHint(tgt.provider, "target");
+    if (t) notes.push(`target provider note — ${t}`);
+  }
+  return notes;
 }
 
 /**
